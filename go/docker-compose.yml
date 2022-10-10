@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  gobuilder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/go/src/github.com/user/builder
+    # tty: true
+    # command: /bin/sh
