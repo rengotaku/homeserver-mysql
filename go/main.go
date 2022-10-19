@@ -39,9 +39,101 @@ const (
 
 type IdentifiedPacket struct {
 	DestIP     net.IP
-	DestPort   layers.TCPPort
+	DestPort   uint16
 	HttpHeader http.Header
 	HttpURL    *url.URL
+}
+
+func (ld *layersData) ID() string {
+	return fmt.Sprintf("%s:%d", ld.IdentifiedPacket.DestIP.String(), ld.IdentifiedPacket.DestPort)
+}
+
+func (ld *layersData) analyzePacket(packet gopacket.Packet) bool {
+	var layNames []string
+	var layerData map[string]interface{}
+	var idPacket IdentifiedPacket
+
+	ip4Layer := packet.Layer(layers.LayerTypeIPv4)
+	if ip4Layer != nil {
+		ip, _ := ip4Layer.(*layers.IPv4)
+
+		expectable := false
+		for _, v := range selfIPs {
+			if ip.SrcIP.Equal(v) {
+				expectable = true
+			}
+		}
+		if !expectable {
+			return false
+		}
+
+		idPacket.DestIP = ip.DstIP
+		log.Debugln(fmt.Sprintf("From %s to %s\n", ip.SrcIP, ip.DstIP))
+	}
+	ip6Layer := packet.Layer(layers.LayerTypeIPv6)
+	if ip6Layer != nil {
+		ip, _ := ip6Layer.(*layers.IPv6)
+
+		expectable := false
+		for _, v := range selfIPs {
+			if ip.SrcIP.Equal(v) {
+				expectable = true
+			}
+		}
+		if !expectable {
+			return false
+		}
+
+		idPacket.DestIP = ip.DstIP
+		log.Debug(fmt.Sprintf("From %s to %s\n", ip.SrcIP, ip.DstIP))
+	}
+
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if tcpLayer != nil {
+		tcp, _ := tcpLayer.(*layers.TCP)
+
+		idPacket.DestPort = uint16(tcp.DstPort)
+		log.Debug(fmt.Sprintf("From port %d to %d\n", tcp.SrcPort, tcp.DstPort))
+	}
+	udpLayer := packet.Layer(layers.LayerTypeUDP)
+	if udpLayer != nil {
+		udp, _ := udpLayer.(*layers.UDP)
+
+		idPacket.DestPort = uint16(udp.DstPort)
+		log.Debug(fmt.Sprintf("From port %d to %d\n", udp.SrcPort, udp.DstPort))
+	}
+
+	applicationLayer := packet.ApplicationLayer()
+	if applicationLayer != nil {
+		// fmt.Printf("%s\n", applicationLayer.Payload())
+
+		// Search for a string inside the payload
+		if strings.Contains(string(applicationLayer.Payload()), "HTTP") {
+			payloadReader := bytes.NewReader(applicationLayer.Payload())
+			bufferedPayloadReader := bufio.NewReader(payloadReader)
+
+			request, _ := http.ReadRequest(bufferedPayloadReader)
+			if request != nil {
+				idPacket.HttpHeader = request.Header
+				idPacket.HttpURL = request.URL
+			}
+		}
+	}
+
+	log.Debugln()
+
+	for _, layer := range packet.Layers() {
+		layNames = append(layNames, layer.LayerType().String())
+	}
+
+	ld.LayName = strings.Join(layNames[:], ",")
+	ld.CaptureLength = packet.Metadata().CaptureLength
+	ld.Timestamp = packet.Metadata().Timestamp
+	ld.Attributes = layerData
+	ld.ErrorFlg = false
+	ld.IdentifiedPacket = idPacket
+
+	return true
 }
 
 type layersData struct {
@@ -50,6 +142,7 @@ type layersData struct {
 	IdentifiedPacket IdentifiedPacket
 	ErrorFlg         bool      `json:"errorFlag"`
 	CaptureLength    int       `json:"captureLength"`
+	EmergedTime      int       `json:"emergedTime"`
 	Timestamp        time.Time `json:"timestamp"`
 }
 
@@ -60,6 +153,7 @@ var (
 	db         *gorm.DB
 	_, _       = time.LoadLocation("Asia/Tokyo")
 	device     *string
+	interval   *int
 	migrateFlg *bool
 	envPath    *string
 	debugFlg   *bool
@@ -72,6 +166,7 @@ func init() {
 
 	device = flag.String("dev", "eth0", "Sniffing capture device.")
 	migrateFlg = flag.Bool("migrate", false, "Initialize database. You need to create database before.")
+	interval = flag.Int("interval", 60, "Interval of aggregating similar packets.")
 	envPath = flag.String("env", ".env", "Path of env file which is written database information, user, password and so on, or using environmental")
 	if os.Getenv("ENV_FILE") != "" {
 		*envPath = os.Getenv("ENV_FILE")
@@ -108,129 +203,55 @@ func init() {
 
 	if *migrateFlg {
 		log.Debugln("Start migration.")
-		db.Migrator().DropTable(&models.Packet{}, &models.RawPacket{})
+		db.Migrator().DropTable(
+			&models.Packet{},
+			&models.RawPacket{},
+		)
 		db.AutoMigrate(&models.RawPacket{})
 		db.AutoMigrate(&models.Packet{})
 		log.Debugln("Finish migration.")
 	}
 }
 
-// func dumpPacketInfo(packet gopacket.Packet) layersData {
-// 	errFlg := false
-// 	// Check for errors
-// 	if err := packet.ErrorLayer(); err != nil {
-// 		errFlg = true
-// 		log.Warningln("Error decoding some part of the packet:", err)
-// 	}
-
-// 	var layNames []string
-// 	var layerData map[string]interface{}
-// 	for _, layer := range packet.Layers() {
-// 		layNames = append(layNames, layer.LayerType().String())
-// 		res1B, _ := json.Marshal(layer)
-// 		json.Unmarshal([]byte(string(res1B)), &layerData)
-// 		delete(layerData, "Payload")
-// 	}
-
-// 	return layersData{
-// 		LayName:       strings.Join(layNames[:], ","),
-// 		Attributes:    layerData,
-// 		ErrorFlg:      errFlg,
-// 		CaptureLength: packet.Metadata().CaptureLength,
-// 		Timestamp:     packet.Metadata().Timestamp,
-// 	}
-// }
-
-func dumpPacketInfo(packet gopacket.Packet) *layersData {
+func availablePacket(packet gopacket.Packet) bool {
 	// Check for errors
 	if err := packet.ErrorLayer(); err != nil {
 		log.Warningln("Error decoding some part of the packet:", err)
-		return nil
+		return false
 	}
 
-	var layNames []string
-	var layerData map[string]interface{}
-	var idPacket IdentifiedPacket
-
+	// IPv4 or IPv6
 	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
 	if ethernetLayer != nil {
 		ethernetPacket, _ := ethernetLayer.(*layers.Ethernet)
 		if ethernetPacket.EthernetType != layers.EthernetTypeIPv4 && ethernetPacket.EthernetType != layers.EthernetTypeIPv6 {
-			return nil
+			return false
 		}
 	}
 
-	ip4Layer := packet.Layer(layers.LayerTypeIPv4)
-	if ip4Layer != nil {
-		ip, _ := ip4Layer.(*layers.IPv4)
-
-		expectable := false
-		for _, v := range selfIPs {
-			if ip.SrcIP.Equal(v) {
-				expectable = true
-			}
-		}
-		if !expectable {
-			return nil
-		}
-
-		idPacket.DestIP = ip.DstIP
-		log.Debugln(fmt.Sprintf("From %s to %s\n", ip.SrcIP, ip.DstIP))
-	}
-	ip6Layer := packet.Layer(layers.LayerTypeIPv6)
-	if ip6Layer != nil {
-		ip, _ := ip6Layer.(*layers.IPv6)
-
-		expectable := false
-		for _, v := range selfIPs {
-			if ip.SrcIP.Equal(v) {
-				expectable = true
-			}
-		}
-		if !expectable {
-			return nil
-		}
-
-		idPacket.DestIP = ip.DstIP
-		log.Debugln(fmt.Sprintf("From %s to %s\n", ip.SrcIP, ip.DstIP))
-	}
-
-	tcpLayer := packet.Layer(layers.LayerTypeTCP)
-	if tcpLayer != nil {
-		tcp, _ := tcpLayer.(*layers.TCP)
-
-		idPacket.DestPort = tcp.DstPort
-		log.Debugln(fmt.Sprintf("From port %d to %d\n", tcp.SrcPort, tcp.DstPort))
-	}
-
-	applicationLayer := packet.ApplicationLayer()
-	if applicationLayer != nil {
-		// fmt.Printf("%s\n", applicationLayer.Payload())
-
-		// Search for a string inside the payload
-		if strings.Contains(string(applicationLayer.Payload()), "HTTP") {
-			payloadReader := bytes.NewReader(applicationLayer.Payload())
-			bufferedPayloadReader := bufio.NewReader(payloadReader)
-
-			request, _ := http.ReadRequest(bufferedPayloadReader)
-			if request != nil {
-				idPacket.HttpHeader = request.Header
-				idPacket.HttpURL = request.URL
-			}
-		}
-	}
-
-	return &layersData{
-		LayName:          strings.Join(layNames[:], ","),
-		Attributes:       layerData,
-		ErrorFlg:         false,
-		IdentifiedPacket: idPacket,
-		CaptureLength:    packet.Metadata().CaptureLength,
-		Timestamp:        packet.Metadata().Timestamp,
-	}
+	return true
 }
 
-func send_data(lDatas []layersData) {
+func sendData(rawLDatas []layersData) {
+	keys := make(map[string]*layersData)
+	for i, _ := range rawLDatas {
+		ld := rawLDatas[i]
+		key := ld.ID()
+		if keys[key] != nil {
+			keys[key].EmergedTime += 1
+			keys[key].CaptureLength += ld.CaptureLength
+		} else {
+			ld.EmergedTime += 1
+			keys[key] = &ld
+		}
+	}
+
+	var lDatas []layersData
+	for _, v := range keys {
+		lDatas = append(lDatas, *v)
+	}
+	log.Infoln("Compressed data ", len(keys), " from ", len(rawLDatas))
+
 	err = db.Transaction(func(tx *gorm.DB) error {
 		var rawPacks []models.RawPacket
 		var packs []models.Packet
@@ -243,43 +264,13 @@ func send_data(lDatas []layersData) {
 			rawPacks = append(rawPacks, rp)
 
 			p := models.Packet{
-				RawPacket: rp,
-				LayerName: lData.LayName,
-				ErrorFlag: lData.ErrorFlg,
-				CreatedAt: lData.Timestamp,
-			}
-
-			if lData.Attributes["DstIP"] != nil {
-				v := lData.Attributes["DstIP"].(string)
-				p.DstIP = &v
-			}
-			if lData.Attributes["SrcIP"] != nil {
-				v := lData.Attributes["SrcIP"].(string)
-				p.SrcIP = &v
-			}
-			if lData.Attributes["DstMAC"] != nil {
-				v := lData.Attributes["DstMAC"].(string)
-				p.DstMAC = &v
-			}
-			if lData.Attributes["SrcMAC"] != nil {
-				v := lData.Attributes["SrcMAC"].(string)
-				p.SrcMAC = &v
-			}
-			if lData.Attributes["DstPort"] != nil {
-				v := int(lData.Attributes["DstPort"].(float64))
-				p.DstPort = &v
-			}
-			if lData.Attributes["SrcPort"] != nil {
-				v := int(lData.Attributes["SrcPort"].(float64))
-				p.SrcPort = &v
-			}
-			if lData.Attributes["Length"] != nil {
-				v := int(lData.Attributes["Length"].(float64))
-				p.Length = &v
-			}
-			if lData.Attributes["TTL"] != nil {
-				v := int(lData.Attributes["TTL"].(float64))
-				p.TTL = &v
+				RawPacket:   rp,
+				LayerName:   lData.LayName,
+				DstIP:       lData.IdentifiedPacket.DestIP.String(),
+				DstPort:     int(lData.IdentifiedPacket.DestPort),
+				EmergedTime: lData.EmergedTime,
+				Length:      lData.CaptureLength,
+				CreatedAt:   lData.Timestamp,
 			}
 
 			packs = append(packs, p)
@@ -325,35 +316,38 @@ func main() {
 	}
 	defer handle.Close()
 
-	// if err := handle.SetBPFFilter("port 3030"); err != nil {
-	// 	panic(err)
-	// }
-
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 
 	log.Info("Start time: ", time.Now())
 	log.Info("Device: ", *device)
 	log.Info("IP address: ", selfIPs)
 
+	nextPeriod := time.Now().Add(time.Second * time.Duration(*interval))
 	var lDatas []layersData
 	for packet := range packetSource.Packets() {
-		lData := dumpPacketInfo(packet)
-		if lData == nil {
-			continue
-		}
-		lDatas = append(lDatas, *lData)
-
-		// Bulk insert when over limit
-		if len(lDatas) >= MaxBatchNum {
+		// Over interval
+		if time.Until(nextPeriod) <= 0 {
 			log.Debugln("Packet length: ", len(lDatas))
 
 			dupLDatas := lDatas
 			wg.Add(1)
-			go send_data(dupLDatas)
+			go sendData(dupLDatas)
 			lDatas = []layersData{}
+
+			nextPeriod = time.Now().Add(time.Second * time.Duration(*interval))
 		}
+
+		if !availablePacket(packet) {
+			continue
+		}
+		ld := layersData{}
+		if !ld.analyzePacket(packet) {
+			continue
+		}
+
+		lDatas = append(lDatas, ld)
 	}
 	wg.Wait()
 
-	send_data(lDatas)
+	sendData(lDatas)
 }
