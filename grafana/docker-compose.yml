@@ -5,5 +5,9 @@ services:
     restart: always
     ports:
       - 13300:3000
+    volumes:
+      - grafana-storage:/var/lib/grafana
 
-    # grafana-storage:/var/lib/grafana
+volumes:
+  grafana-storage:
+    driver: local

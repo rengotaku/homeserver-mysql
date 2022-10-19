@@ -233,6 +233,9 @@ func availablePacket(packet gopacket.Packet) bool {
 }
 
 func sendData(rawLDatas []layersData) {
+	detectIPs()
+	log.Info("IP address: ", selfIPs)
+
 	keys := make(map[string]*layersData)
 	for i, _ := range rawLDatas {
 		ld := rawLDatas[i]
@@ -291,23 +294,30 @@ func sendData(rawLDatas []layersData) {
 	wg.Done()
 }
 
-func main() {
+func detectIPs() {
 	// Find all devices
 	devs, err := pcap.FindAllDevs()
 	if err != nil {
 		log.Fatalln(err)
 	}
 
+	ips := []net.IP{}
 	for _, dev := range devs {
 		if *device == dev.Name {
 			for _, address := range dev.Addresses {
-				selfIPs = append(selfIPs, address.IP)
+				ips = append(ips, address.IP)
 			}
 		}
 	}
-	if len(selfIPs) <= 0 {
+	if len(ips) <= 0 {
 		log.Fatalln("The device dosen't exist: ", *device)
 	}
+
+	selfIPs = ips
+}
+
+func main() {
+	detectIPs()
 
 	handle, err = pcap.OpenLive(*device, defaultSnapLen, false,
 		pcap.BlockForever)
