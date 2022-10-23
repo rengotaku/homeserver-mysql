@@ -1,23 +1,11 @@
-version: "3"
+version: '3'
+
 services:
-  db:
-    image: mysql:8.0.30
-    # NOTE: use of "mysql_native_password" is not recommended: https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password
-    # (this is just an example, not intended to be a production configuration)
-    command: --default-authentication-plugin=mysql_native_password
-    restart: always
-    ports:
-      - 3306:3306
+  gobuilder:
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
-      - mysql-data:/var/lib/mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Tokyo
-volumes:
-  mysql-data:
-    driver: local
-    # Specific storage location for production
-    # driver_opts:
-    #   type: 'none'
-    #   o: 'bind'
-    #   device: '/srv/db-data'
+      - .:/go/src/github.com/user/builder
+    # tty: true
+    # command: /bin/sh
