@@ -364,7 +364,7 @@ func main() {
 		select {
 		case now := <-thoutTim.C:
 			log.Debugln("Time to check: ", now, lstTime)
-			if now.Sub(lstTime) < time.Duration(*timeout) {
+			if now.Sub(lstTime) < time.Duration(*timeout)*time.Second {
 				continue
 			}
 
@@ -397,12 +397,11 @@ func main() {
 			log.Warnln("Close packet stream")
 			pcapHandler.Close()
 			log.Warnln("Restarting sniffing packet stream")
+			lstTime := time.Now()
 			go sniffPackets(lDatas, &lstTime)
 		case <-lookupTim.C:
 			ips := []models.Hostname{}
-			// db.Where("hostname is null and error_flg = ?", false).Limit(10).Find(&ips)
-			db.Where(&models.Hostname{Hostname: nil, ErrorFlg: false}).Find(&ips)
-			log.Infoln("Lookup ip addresses: ", len(ips))
+			db.Where("hostname is null and error_flg = ?", false).Limit(10).Find(&ips)
 			if len(ips) == 0 {
 				continue
 			}
