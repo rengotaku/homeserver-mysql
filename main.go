@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -147,17 +148,18 @@ type layersData struct {
 }
 
 var (
-	err         error
-	pcapHandler *pcap.Handle
-	db          *gorm.DB
-	_, _        = time.LoadLocation("Asia/Tokyo")
-	device      *string
-	interval    *int
-	migrateFlg  *bool
-	envPath     *string
-	debugFlg    *bool
-	selfIPs     []net.IP
-	timeout     *int
+	err               error
+	pcapHandler       *pcap.Handle
+	db                *gorm.DB
+	_, _              = time.LoadLocation("Asia/Tokyo")
+	device            *string
+	interval          *int
+	migrateFlg        *bool
+	envPath           *string
+	debugFlg          *bool
+	selfIPs           []net.IP
+	timeout           *int
+	healthCheckMutext sync.Mutex
 )
 
 func init() {
@@ -168,7 +170,7 @@ func init() {
 	migrateFlg = flag.Bool("migrate", false, "Initialize database. You need to create database before.")
 	interval = flag.Int("interval", 60, "Interval of aggregating similar packets.")
 	envPath = flag.String("env", ".env", "Path of env file which is written database information, user, password and so on, or using environmental")
-	timeout = flag.Int("timeout", 30, "Hogehoge")
+	timeout = flag.Int("timeout", 60, "Hogehoge")
 	if os.Getenv("ENV_FILE") != "" {
 		*envPath = os.Getenv("ENV_FILE")
 	}
@@ -296,14 +298,12 @@ func detectIPs() []net.IP {
 func sniffPackets(lDatas []layersData, lstTime *time.Time) {
 	pcapHandler, err = pcap.OpenLive(*device, defaultSnapLen, false, pcap.BlockForever)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalln("OpenLive: ", err)
 	}
 
 	packetSource := gopacket.NewPacketSource(pcapHandler, pcapHandler.LinkType())
 
-	log.Info("Start time: ", time.Now())
-	log.Info("Device: ", *device)
-	log.Info("IP address: ", selfIPs)
+	log.Info("Start time: ", time.Now(), "Device: ", *device, "IP address: ", selfIPs)
 
 	flushTim := time.NewTicker(time.Duration(*interval) * time.Second)
 
@@ -314,6 +314,7 @@ func sniffPackets(lDatas []layersData, lstTime *time.Time) {
 
 			// Maybe closing handle
 			if packet == nil {
+				flushTim.Stop()
 				return
 			}
 
@@ -357,7 +358,7 @@ func main() {
 	lookupTim := time.NewTicker(time.Duration(lupInv) * time.Second)
 
 	// Not sure interval is right.
-	thoutTim := time.NewTicker(time.Duration(*timeout/3) * time.Second)
+	thoutTim := time.NewTicker(time.Duration(*timeout) * time.Second)
 	// Checking whether connection is working.(In my case, connection as PPPoE is broken when it switch new IP address.)
 	// If connection was broken, you'll stay to get a packet from packet channel.
 	for {
@@ -376,28 +377,30 @@ func main() {
 
 			selfIPs = detectIPs()
 			if len(selfIPs) == 0 {
-				log.Warnln("Specific device dosen't exist: ", *device)
+				log.Warnln("Detect specific device inexistant: ", *device)
 
 				thoutTim.Stop()
 				// Waiting for reconnection until 180 seconds.
-				for dRetrTim := 0; dRetrTim < 36; dRetrTim++ {
-					time.Sleep(5 * time.Second)
+				for dRetrTim := 1; dRetrTim <= 36; dRetrTim++ {
+					time.Sleep(10 * time.Second)
 
 					selfIPs = detectIPs()
 					if len(selfIPs) > 0 {
 						break
 					}
+					log.Warnln("Elapsed time waiting for detecting specific device existant: ", dRetrTim*5, "sec")
 				}
 				if len(selfIPs) == 0 {
 					log.Fatalln("Specific device dosen't exist: ", *device)
 				}
-				thoutTim.Reset(time.Duration(*timeout/3) * time.Second)
+				thoutTim.Reset(time.Duration(*timeout) * time.Second)
 			}
 
-			log.Warnln("Close packet stream")
+			log.Infoln("Close packet stream")
 			pcapHandler.Close()
-			log.Warnln("Restarting sniffing packet stream")
-			lstTime := time.Now()
+			time.Sleep(1 * time.Second)
+			log.Infoln("Restarting sniffing packet stream")
+			lstTime = time.Now()
 			go sniffPackets(lDatas, &lstTime)
 		case <-lookupTim.C:
 			ips := []models.Hostname{}
